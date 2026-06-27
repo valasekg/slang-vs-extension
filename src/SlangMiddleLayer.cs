@@ -79,6 +79,14 @@ namespace SlangClient
             switch( methodName )
             {
                 case Methods.TextDocumentDidOpenName:
+                    // Hold the document open until slangd has answered its workspace/configuration
+                    // pull (slangd sends that right after initialize, independently of didOpen).
+                    // Otherwise slangd compiles this file with no include search paths and caches
+                    // an unresolved #include that subsequent edits never re-resolve.
+                    if (SlangLanguageClient.Instance != null)
+                    {
+                        await SlangLanguageClient.Instance.WaitForConfigPullAsync(3000);
+                    }
                     await sendNotification(methodParam);
                     DidOpenTextDocumentParams didOpenTextDocumentParams = methodParam.ToObject<DidOpenTextDocumentParams>(new Newtonsoft.Json.JsonSerializer() { MissingMemberHandling = Newtonsoft.Json.MissingMemberHandling.Ignore });
                     var configPath = SlangLanguageClient.Instance.GetNewConfigurationPath(didOpenTextDocumentParams.TextDocument.Uri);

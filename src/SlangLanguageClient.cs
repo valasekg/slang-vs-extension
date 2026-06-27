@@ -7,6 +7,7 @@ using Microsoft.VisualStudio.Text.Editor;
 using Microsoft.VisualStudio.Threading;
 using Microsoft.VisualStudio.Utilities;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using StreamJsonRpc;
 using System;
 using System.Collections.Concurrent;
@@ -70,6 +71,17 @@ namespace SlangClient
         public object WorkspaceOptions = null;
         public string ClangFormatLocation = null;
 
+        // Completed once slangd's workspace/configuration pull has been answered with the
+        // discovered search paths. The didOpen middle-layer awaits this so slangd has the
+        // include search paths before it first compiles the document — otherwise it compiles
+        // with no search path and caches an unresolved #include that later edits never re-fix.
+        private TaskCompletionSource<bool> _configPullAnswered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task WaitForConfigPullAsync(int timeoutMs)
+        {
+            return Task.WhenAny(_configPullAnswered.Task, Task.Delay(timeoutMs));
+        }
+
         public ConcurrentDictionary<string, PublishDiagnosticParams> diagnostics = new ConcurrentDictionary<string, PublishDiagnosticParams>(Environment.ProcessorCount * 2, 32);
         public ConcurrentDictionary<string, ITextView> textViews = new ConcurrentDictionary<string, ITextView>(Environment.ProcessorCount * 2, 32);
         System.Diagnostics.Process process;
@@ -102,15 +114,23 @@ namespace SlangClient
             textEditorFactoryService.TextViewCreated += OnTextViewCreated;
             Instance = this;
             await Task.Yield();
-            
+
             ClangFormatLocation = await FindClangFormatAsync();
 
             ConfigFileWatcher = null;
+            _configPullAnswered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             if (SlangWorkspace.Instance != null)
             {
                 await SlangWorkspace.Instance.DoSettingsAsync();
             }
+
+            // Discover slangdconfig.json now, before slangd starts. slangd pulls its
+            // settings (workspace/configuration) immediately after initialize and compiles
+            // the first opened document right after; if WorkspaceOptions isn't populated yet
+            // the pull is answered empty and the include search paths never reach the first
+            // compile. Pre-populating here lets ProvideConfiguration answer instantly.
+            EnsureConfigurationDiscovered();
 
             string languageServerPath = Path.GetDirectoryName(typeof(SlangLanguageClient).Assembly.Location);
             languageServerPath = Path.Combine(languageServerPath, "SlangServer", "slangd.exe");
@@ -170,10 +190,13 @@ namespace SlangClient
 
         public void NotifyClangFormatLocation()
         {
-            // Just send clangformat location to slangd.
+            // Merge the clang-format location into the existing configuration instead of
+            // replacing it. This runs on every server (re)initialize; overwriting here
+            // would wipe slang.additionalSearchPaths / slang.predefinedMacros that were
+            // already discovered from slangdconfig.json.
             if (ClangFormatLocation != null)
             {
-                dynamic configObj = JsonConvert.DeserializeObject<dynamic>("{}");
+                JObject configObj = WorkspaceOptions as JObject ?? new JObject();
                 configObj["slang.format.clangFormatLocation"] = ClangFormatLocation;
                 WorkspaceOptions = configObj;
                 NotifyConfigChange();
@@ -242,9 +265,88 @@ namespace SlangClient
 
         private void NotifyConfigChange()
         {
+            // _rpc is not attached yet during eager discovery in ActivateAsync; the pull
+            // handler delivers the config in that case, so skip the (impossible) push.
+            if (_rpc == null)
+            {
+                return;
+            }
             DidChangeConfigurationParams configParams = new DidChangeConfigurationParams();
             configParams.Settings = WorkspaceOptions;
             Task task = Task.Run(async () => await _rpc.NotifyAsync(Methods.WorkspaceDidChangeConfigurationName, configParams));
+        }
+
+        // Answers slangd's "workspace/configuration" pull (see SlangServerMessageTarget).
+        // slangd requests this once right after initialize — before any textDocument/didOpen —
+        // and it is the ONLY channel through which it reads slang.additionalSearchPaths /
+        // slang.predefinedMacros. Without this the server got a -32601 error and never learned
+        // the include search paths from slangdconfig.json. Each requested item carries a
+        // "section" (e.g. "slang.additionalSearchPaths"); we return the matching value from the
+        // discovered config (search paths already resolved to absolute), or null.
+        public object[] ProvideConfiguration(JToken args)
+        {
+            EnsureConfigurationDiscovered();
+
+            JArray items = args?["items"] as JArray;
+            int count = items?.Count ?? 0;
+            object[] result = new object[count];
+
+            JObject options = WorkspaceOptions as JObject;
+            for (int i = 0; i < count; i++)
+            {
+                string section = items[i]?["section"]?.ToString();
+                result[i] = (options != null && section != null) ? options[section] : null;
+            }
+
+            // Unblock didOpen once the search paths have actually been handed to slangd.
+            if (options != null && options["slang.additionalSearchPaths"] != null)
+            {
+                _configPullAnswered.TrySetResult(true);
+            }
+            return result;
+        }
+
+        // The config pull arrives before the first didOpen, so WorkspaceOptions may still be
+        // empty. Anchor discovery on any already-open .slang document (the one that activated
+        // the language client) and read its slangdconfig.json right now.
+        private void EnsureConfigurationDiscovered()
+        {
+            JObject options = WorkspaceOptions as JObject;
+            if (options != null && options["slang.additionalSearchPaths"] != null)
+                return;
+
+            IEnumerable<string> openDocs = textViews.Keys;
+            if (SlangWorkspace.Instance != null)
+                openDocs = openDocs.Concat(SlangWorkspace.Instance.m_TextViewsDictionary.Keys);
+
+            foreach (string key in openDocs.Distinct())
+            {
+                try
+                {
+                    Uri uri;
+                    if (!Uri.TryCreate(key, UriKind.Absolute, out uri) || !uri.IsFile)
+                        continue;
+
+                    string cfg = FindConfigFile(UriToLocalPath(uri));
+                    if (cfg == null)
+                        continue;
+
+                    string current = ConfigFileWatcher == null ? "" :
+                        Path.Combine(ConfigFileWatcher.Path, ConfigFileWatcher.Filter);
+                    if (current != cfg)
+                    {
+                        ConfigFileWatcher = new FileSystemWatcher(Path.GetDirectoryName(cfg), Path.GetFileName(cfg));
+                        ConfigFileWatcher.Changed += ConfigFileWatcher_Changed;
+                        ConfigFileWatcher.EnableRaisingEvents = true;
+                    }
+                    ReadAndNotifyConfigurationChange();
+
+                    options = WorkspaceOptions as JObject;
+                    if (options != null && options["slang.additionalSearchPaths"] != null)
+                        return;
+                }
+                catch { }
+            }
         }
 
         private void ConfigFileWatcher_Changed(object sender, FileSystemEventArgs e)
