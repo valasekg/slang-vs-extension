@@ -27,5 +27,19 @@ namespace SlangClient
         [ContentType(SlangContentType)]
         internal static FileExtensionToContentTypeDefinition SlangFileExtensionDefinition = null;
 
+        [Export]
+        [FileExtension(".slangh")]
+        [ContentType(SlangContentType)]
+        internal static FileExtensionToContentTypeDefinition SlangHeaderFileExtensionDefinition = null;
+
+        [Export]
+        [FileExtension(".usf")]
+        [ContentType(SlangContentType)]
+        internal static FileExtensionToContentTypeDefinition UnrealShaderFileExtensionDefinition = null;
+
+        [Export]
+        [FileExtension(".ush")]
+        [ContentType(SlangContentType)]
+        internal static FileExtensionToContentTypeDefinition UnrealHeaderFileExtensionDefinition = null;
     }
 }
