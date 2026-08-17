@@ -56,6 +56,7 @@
     <Compile Include="src\SlangCommands.cs" />
     <Compile Include="src\SlangContentDefinition.cs" />
     <Compile Include="src\SlangLanguageClient.cs" />
+    <Compile Include="src\SlangLineNumberMargin.cs" />
     <Compile Include="src\SlangMiddleLayer.cs" />
     <Compile Include="src\SlangServerMessageTarget.cs" />
     <Compile Include="src\SlangTokenHighlightTagger.cs" />
